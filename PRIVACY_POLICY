@@ -1,0 +1,35 @@
+Privacy Policy
+
+DJ Boi Discord Music Bot (“the Bot”) respects your privacy and aims to keep your information safe. This policy explains what data is collected and how it is used.
+
+1. Data Collection
+
+- The Bot does not intentionally collect or store personal information such as usernames, email addresses, or message contents.
+- The Bot may temporarily process Discord user IDs, channel IDs, and server (guild) IDs in memory for the purpose of providing its features (such as music playback and queue management).
+
+2. Data Usage
+
+- Data processed by the Bot is used solely to provide music playback and related features as requested by users via Discord commands.
+
+3. Data Storage
+
+- The Bot does not store any data persistently outside of temporary memory necessary for operation.
+- No user data is shared with third parties.
+
+4. Third-Party Services
+
+- The Bot uses external services (such as YouTube via yt-dlp and Discord APIs) to provide music streaming functionality. Use of these services is subject to their own privacy policies.
+
+5. Children's Privacy
+
+- The Bot does not knowingly collect or store data from users under the age of 13. If you believe such data has been collected, please contact the maintainer for removal.
+
+6. Changes to this Policy
+
+- This Privacy Policy may be updated from time to time. Continued use of the Bot constitutes acceptance of the current policy.
+
+7. Contact
+
+- For questions or concerns regarding this Privacy Policy, please open an issue on the GitHub repository.
+
+Last updated: July 9, 2025
