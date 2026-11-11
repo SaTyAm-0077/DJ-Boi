@@ -1,5 +1,6 @@
 
 import os
+import sys
 import asyncio
 import tempfile
 from pathlib import Path
@@ -9,9 +10,10 @@ import discord
 from discord.ext import commands
 import yt_dlp
 
-# --------------------------------------------------
+
+# ==================================================
 # CONFIGURATION
-# --------------------------------------------------
+# ==================================================
 
 load_dotenv()
 
@@ -46,20 +48,18 @@ FFMPEG_OPTIONS = {
 }
 
 
-# --------------------------------------------------
+# ==================================================
 # YOUTUBE DOWNLOAD
-# --------------------------------------------------
+# ==================================================
 
 def download_audio(query):
-    """
-    Downloads audio and returns its local path and title.
-    """
 
     with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
 
         info = ydl.extract_info(query, download=True)
 
         if "entries" in info:
+
             entries = info["entries"]
 
             if not entries:
@@ -70,29 +70,51 @@ def download_audio(query):
         filepath = Path(ydl.prepare_filename(info))
 
         if not filepath.exists():
-            # Some formats may use a different extension.
-            matches = list(DOWNLOAD_DIR.glob(f"{info['id']}.*"))
+
+            matches = list(
+                DOWNLOAD_DIR.glob(f"{info['id']}.*")
+            )
 
             if not matches:
                 raise Exception("Downloaded audio file not found.")
 
             filepath = matches[0]
 
-        return str(filepath), info.get("title", "Unknown Title")
+        if filepath.stat().st_size == 0:
+            raise Exception("Downloaded audio file is empty.")
+
+        print(f"[DOWNLOAD] Completed: {info.get('title')}")
+        print(f"[DOWNLOAD] File: {filepath}")
+        print(f"[DOWNLOAD] Size: {filepath.stat().st_size} bytes")
+
+        return str(filepath), info.get(
+            "title", "Unknown Title"
+        )
 
 
-# --------------------------------------------------
+# ==================================================
 # MUSIC STATE
-# --------------------------------------------------
+# ==================================================
 
 class MusicState:
 
     def __init__(self):
+
         self.queue = asyncio.Queue()
         self.current = None
         self.now_playing = None
         self.play_next_song = asyncio.Event()
         self.player_task = None
+
+    @staticmethod
+    def cleanup(filepath):
+
+        try:
+            Path(filepath).unlink(missing_ok=True)
+            print(f"[CLEANUP] Deleted: {filepath}")
+
+        except Exception as error:
+            print(f"[CLEANUP] Error: {error}")
 
     async def audio_player_task(self, voice_client):
 
@@ -109,7 +131,11 @@ class MusicState:
             filepath, title = self.current
             self.now_playing = title
 
+            print(f"[AUDIO] Preparing: {title}")
+
             if not voice_client or not voice_client.is_connected():
+
+                print("[AUDIO] Voice client is disconnected.")
                 self.cleanup(filepath)
                 break
 
@@ -117,6 +143,7 @@ class MusicState:
 
                 audio_source = discord.FFmpegPCMAudio(
                     filepath,
+                    stderr=sys.stderr,
                     **FFMPEG_OPTIONS
                 )
 
@@ -125,7 +152,9 @@ class MusicState:
                 def after_playing(error):
 
                     if error:
-                        print(f"Playback error: {error}")
+                        print(f"[AUDIO] Playback callback error: {error}")
+                    else:
+                        print("[AUDIO] Playback callback completed.")
 
                     try:
                         loop.call_soon_threadsafe(
@@ -134,39 +163,76 @@ class MusicState:
                     except RuntimeError:
                         pass
 
+                print(f"[AUDIO] Starting FFmpeg: {title}")
+
                 voice_client.play(
                     audio_source,
                     after=after_playing
                 )
 
+                print(
+                    f"[AUDIO] Voice playing immediately: "
+                    f"{voice_client.is_playing()}"
+                )
+
+                print(
+                    f"[AUDIO] Voice connected: "
+                    f"{voice_client.is_connected()}"
+                )
+
+                # Diagnostic check after three seconds.
+                await asyncio.sleep(3)
+
+                print(
+                    f"[AUDIO] Still playing after 3 seconds: "
+                    f"{voice_client.is_playing()}"
+                )
+
+                print(
+                    f"[AUDIO] Still connected: "
+                    f"{voice_client.is_connected()}"
+                )
+
+                if not voice_client.is_playing() and not self.play_next_song.is_set():
+                    print(
+                        "[AUDIO] WARNING: Playback stopped "
+                        "before the song finished."
+                    )
+
                 await self.play_next_song.wait()
 
             except asyncio.CancelledError:
+
+                print("[AUDIO] Player task cancelled.")
+
                 if voice_client.is_playing():
                     voice_client.stop()
+
                 self.cleanup(filepath)
                 break
 
             except Exception as error:
-                print(f"Audio player error: {error}")
+
+                print(f"[AUDIO] Player error: {error}")
 
             finally:
-                self.cleanup(filepath)
 
-            self.current = None
-            self.now_playing = None
+                self.cleanup(filepath)
+                self.current = None
+                self.now_playing = None
+
+                try:
+                    self.queue.task_done()
+                except ValueError:
+                    pass
 
         self.current = None
         self.now_playing = None
 
-    @staticmethod
-    def cleanup(filepath):
-        try:
-            Path(filepath).unlink(missing_ok=True)
-        except Exception as error:
-            print(f"File cleanup error: {error}")
+        print("[AUDIO] Player task ended.")
 
 
+# One music state per server
 music_states = {}
 
 
@@ -178,9 +244,9 @@ def get_music_state(guild_id):
     return music_states[guild_id]
 
 
-# --------------------------------------------------
+# ==================================================
 # BOT EVENTS
-# --------------------------------------------------
+# ==================================================
 
 @bot.event
 async def on_ready():
@@ -189,9 +255,9 @@ async def on_ready():
     print("Music bot is ready!")
 
 
-# --------------------------------------------------
+# ==================================================
 # JOIN
-# --------------------------------------------------
+# ==================================================
 
 @bot.slash_command(
     name="join",
@@ -202,6 +268,7 @@ async def join(ctx):
     await ctx.defer()
 
     if not ctx.author.voice:
+
         await ctx.followup.send(
             "You need to be in a voice channel first.",
             ephemeral=True
@@ -223,7 +290,7 @@ async def join(ctx):
 
     except Exception as error:
 
-        print(f"Join error: {error}")
+        print(f"[JOIN] Error: {error}")
 
         await ctx.followup.send(
             f"Could not join voice channel: {error}",
@@ -231,9 +298,9 @@ async def join(ctx):
         )
 
 
-# --------------------------------------------------
+# ==================================================
 # PLAY
-# --------------------------------------------------
+# ==================================================
 
 @bot.slash_command(
     name="play",
@@ -250,6 +317,7 @@ async def play(
     await ctx.defer()
 
     if not ctx.author.voice:
+
         await ctx.followup.send(
             "Join a voice channel before playing music.",
             ephemeral=True
@@ -263,14 +331,17 @@ async def play(
         voice_client = ctx.voice_client
 
         if voice_client:
+
             if voice_client.channel != channel:
                 await voice_client.move_to(channel)
+
         else:
+
             voice_client = await channel.connect()
 
     except Exception as error:
 
-        print(f"Voice connection error: {error}")
+        print(f"[VOICE] Connection error: {error}")
 
         await ctx.followup.send(
             f"Could not connect to voice channel: {error}",
@@ -291,7 +362,7 @@ async def play(
 
     except Exception as error:
 
-        print(f"Download error: {error}")
+        print(f"[DOWNLOAD] Error: {error}")
 
         await ctx.channel.send(
             f"Could not download that song: {error}"
@@ -302,7 +373,12 @@ async def play(
 
     await state.queue.put((filepath, title))
 
-    if state.player_task is None or state.player_task.done():
+    print(f"[QUEUE] Added: {title}")
+
+    if (
+        state.player_task is None
+        or state.player_task.done()
+    ):
 
         state.player_task = asyncio.create_task(
             state.audio_player_task(voice_client)
@@ -313,9 +389,9 @@ async def play(
     )
 
 
-# --------------------------------------------------
+# ==================================================
 # QUEUE
-# --------------------------------------------------
+# ==================================================
 
 @bot.slash_command(
     name="queue",
@@ -328,30 +404,37 @@ async def queue(ctx):
     upcoming = list(state.queue._queue)
 
     if not state.now_playing and not upcoming:
+
         await ctx.respond("The queue is empty.")
         return
 
     message = ""
 
     if state.now_playing:
-        message += f"**Now playing:** {state.now_playing}\n\n"
+
+        message += (
+            f"**Now playing:** {state.now_playing}\n\n"
+        )
 
     if upcoming:
+
         message += "**Up next:**\n"
 
         for index, song in enumerate(upcoming, start=1):
+
             _, title = song
             message += f"`{index}.` {title}\n"
 
     else:
+
         message += "No more songs in the queue."
 
     await ctx.respond(message[:1900])
 
 
-# --------------------------------------------------
+# ==================================================
 # SKIP
-# --------------------------------------------------
+# ==================================================
 
 @bot.slash_command(
     name="skip",
@@ -362,6 +445,7 @@ async def skip(ctx):
     voice_client = ctx.voice_client
 
     if not voice_client or not voice_client.is_playing():
+
         await ctx.respond(
             "Nothing is currently playing.",
             ephemeral=True
@@ -373,9 +457,9 @@ async def skip(ctx):
     await ctx.respond("Skipped the current song.")
 
 
-# --------------------------------------------------
+# ==================================================
 # PAUSE
-# --------------------------------------------------
+# ==================================================
 
 @bot.slash_command(
     name="pause",
@@ -386,18 +470,21 @@ async def pause(ctx):
     voice_client = ctx.voice_client
 
     if voice_client and voice_client.is_playing():
+
         voice_client.pause()
         await ctx.respond("Music paused.")
+
     else:
+
         await ctx.respond(
             "Nothing is currently playing.",
             ephemeral=True
         )
 
 
-# --------------------------------------------------
+# ==================================================
 # RESUME
-# --------------------------------------------------
+# ==================================================
 
 @bot.slash_command(
     name="resume",
@@ -408,18 +495,21 @@ async def resume(ctx):
     voice_client = ctx.voice_client
 
     if voice_client and voice_client.is_paused():
+
         voice_client.resume()
         await ctx.respond("Music resumed.")
+
     else:
+
         await ctx.respond(
             "Music is not paused.",
             ephemeral=True
         )
 
 
-# --------------------------------------------------
+# ==================================================
 # STOP
-# --------------------------------------------------
+# ==================================================
 
 @bot.slash_command(
     name="stop",
@@ -430,16 +520,11 @@ async def stop(ctx):
     state = get_music_state(ctx.guild.id)
     voice_client = ctx.voice_client
 
-    # Empty upcoming queue and remove downloaded files.
-    while not state.queue.empty():
+    # Stop current playback first.
+    if voice_client and voice_client.is_playing():
+        voice_client.stop()
 
-        try:
-            filepath, _ = state.queue.get_nowait()
-            state.queue.task_done()
-            state.cleanup(filepath)
-        except asyncio.QueueEmpty:
-            break
-
+    # Cancel the player task.
     if state.player_task and not state.player_task.done():
 
         state.player_task.cancel()
@@ -450,18 +535,33 @@ async def stop(ctx):
             pass
 
     state.player_task = None
+
+    # Clear upcoming songs.
+    while not state.queue.empty():
+
+        try:
+
+            filepath, _ = state.queue.get_nowait()
+            state.queue.task_done()
+            state.cleanup(filepath)
+
+        except asyncio.QueueEmpty:
+            break
+
     state.current = None
     state.now_playing = None
 
     if voice_client:
         await voice_client.disconnect()
 
-    await ctx.respond("Music stopped and queue cleared.")
+    await ctx.respond(
+        "Music stopped and queue cleared."
+    )
 
 
-# --------------------------------------------------
+# ==================================================
 # CLEAR
-# --------------------------------------------------
+# ==================================================
 
 @bot.slash_command(
     name="clear",
@@ -474,18 +574,20 @@ async def clear(ctx):
     while not state.queue.empty():
 
         try:
+
             filepath, _ = state.queue.get_nowait()
             state.queue.task_done()
             state.cleanup(filepath)
+
         except asyncio.QueueEmpty:
             break
 
     await ctx.respond("The queue has been cleared.")
 
 
-# --------------------------------------------------
+# ==================================================
 # NOW PLAYING
-# --------------------------------------------------
+# ==================================================
 
 @bot.slash_command(
     name="nowplaying",
@@ -496,18 +598,21 @@ async def nowplaying(ctx):
     state = get_music_state(ctx.guild.id)
 
     if state.now_playing:
+
         await ctx.respond(
             f"**Now playing:** {state.now_playing}"
         )
+
     else:
+
         await ctx.respond(
             "Nothing is currently playing.",
             ephemeral=True
         )
 
 
-# --------------------------------------------------
-# RUN
-# --------------------------------------------------
+# ==================================================
+# RUN BOT
+# ==================================================
 
 bot.run(TOKEN)
