@@ -1,7 +1,8 @@
 
 import os
 import asyncio
-import shlex
+import tempfile
+from pathlib import Path
 
 from dotenv import load_dotenv
 import discord
@@ -17,10 +18,13 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
 if not TOKEN:
-    raise RuntimeError("DISCORD_TOKEN is missing from environment variables.")
+    raise RuntimeError("DISCORD_TOKEN is missing.")
 
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+DOWNLOAD_DIR = Path(tempfile.gettempdir()) / "music_bot"
+DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 YDL_OPTIONS = {
     "format": "bestaudio/best",
@@ -30,27 +34,30 @@ YDL_OPTIONS = {
     "default_search": "ytsearch",
     "extract_flat": False,
     "remote_components": ["ejs:github"],
+    "outtmpl": str(DOWNLOAD_DIR / "%(id)s.%(ext)s"),
+    "overwrites": True,
+    "retries": 3,
+    "fragment_retries": 3,
 }
 
-FFMPEG_BEFORE_OPTIONS = (
-    "-reconnect 1 "
-    "-reconnect_streamed 1 "
-    "-reconnect_delay_max 5"
-)
+FFMPEG_OPTIONS = {
+    "before_options": "-nostdin",
+    "options": "-vn",
+}
 
 
 # --------------------------------------------------
-# YOUTUBE EXTRACTION
+# YOUTUBE DOWNLOAD
 # --------------------------------------------------
 
-def get_audio_source(query):
+def download_audio(query):
     """
-    Extracts the audio URL, title and HTTP headers
-    required by YouTube for playback.
+    Downloads audio and returns its local path and title.
     """
 
     with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
-        info = ydl.extract_info(query, download=False)
+
+        info = ydl.extract_info(query, download=True)
 
         if "entries" in info:
             entries = info["entries"]
@@ -60,14 +67,18 @@ def get_audio_source(query):
 
             info = entries[0]
 
-        if not info or not info.get("url"):
-            raise Exception("Could not extract audio URL.")
+        filepath = Path(ydl.prepare_filename(info))
 
-        return (
-            info["url"],
-            info.get("title", "Unknown Title"),
-            info.get("http_headers", {})
-        )
+        if not filepath.exists():
+            # Some formats may use a different extension.
+            matches = list(DOWNLOAD_DIR.glob(f"{info['id']}.*"))
+
+            if not matches:
+                raise Exception("Downloaded audio file not found.")
+
+            filepath = matches[0]
+
+        return str(filepath), info.get("title", "Unknown Title")
 
 
 # --------------------------------------------------
@@ -95,33 +106,18 @@ class MusicState:
             except asyncio.CancelledError:
                 break
 
-            if not voice_client or not voice_client.is_connected():
-                self.current = None
-                self.now_playing = None
-                break
-
-            source, title, headers = self.current
+            filepath, title = self.current
             self.now_playing = title
 
-            header_string = "".join(
-                f"{key}: {value}\r\n"
-                for key, value in headers.items()
-            )
-
-            before_options = FFMPEG_BEFORE_OPTIONS
-
-            if header_string:
-                before_options += (
-                    " -headers "
-                    + shlex.quote(header_string)
-                )
+            if not voice_client or not voice_client.is_connected():
+                self.cleanup(filepath)
+                break
 
             try:
 
                 audio_source = discord.FFmpegPCMAudio(
-                    source,
-                    before_options=before_options,
-                    options="-vn"
+                    filepath,
+                    **FFMPEG_OPTIONS
                 )
 
                 loop = asyncio.get_running_loop()
@@ -146,10 +142,16 @@ class MusicState:
                 await self.play_next_song.wait()
 
             except asyncio.CancelledError:
+                if voice_client.is_playing():
+                    voice_client.stop()
+                self.cleanup(filepath)
                 break
 
             except Exception as error:
                 print(f"Audio player error: {error}")
+
+            finally:
+                self.cleanup(filepath)
 
             self.current = None
             self.now_playing = None
@@ -157,8 +159,14 @@ class MusicState:
         self.current = None
         self.now_playing = None
 
+    @staticmethod
+    def cleanup(filepath):
+        try:
+            Path(filepath).unlink(missing_ok=True)
+        except Exception as error:
+            print(f"File cleanup error: {error}")
 
-# One music state per Discord server
+
 music_states = {}
 
 
@@ -182,7 +190,7 @@ async def on_ready():
 
 
 # --------------------------------------------------
-# JOIN COMMAND
+# JOIN
 # --------------------------------------------------
 
 @bot.slash_command(
@@ -205,11 +213,8 @@ async def join(ctx):
     try:
 
         if ctx.voice_client:
-
             await ctx.voice_client.move_to(channel)
-
         else:
-
             await channel.connect()
 
         await ctx.followup.send(
@@ -221,18 +226,18 @@ async def join(ctx):
         print(f"Join error: {error}")
 
         await ctx.followup.send(
-            f"Could not join the voice channel: {error}",
+            f"Could not join voice channel: {error}",
             ephemeral=True
         )
 
 
 # --------------------------------------------------
-# PLAY COMMAND
+# PLAY
 # --------------------------------------------------
 
 @bot.slash_command(
     name="play",
-    description="Play a song from YouTube."
+    description="Download and play a song from YouTube."
 )
 async def play(
     ctx,
@@ -258,12 +263,9 @@ async def play(
         voice_client = ctx.voice_client
 
         if voice_client:
-
             if voice_client.channel != channel:
                 await voice_client.move_to(channel)
-
         else:
-
             voice_client = await channel.connect()
 
     except Exception as error:
@@ -271,33 +273,34 @@ async def play(
         print(f"Voice connection error: {error}")
 
         await ctx.followup.send(
-            f"Could not connect to your voice channel: {error}",
+            f"Could not connect to voice channel: {error}",
             ephemeral=True
         )
         return
 
+    await ctx.followup.send(
+        "Searching and downloading your song..."
+    )
+
     try:
 
-        audio_url, title, headers = await asyncio.to_thread(
-            get_audio_source,
+        filepath, title = await asyncio.to_thread(
+            download_audio,
             query
         )
 
     except Exception as error:
 
-        print(f"YouTube extraction error: {error}")
+        print(f"Download error: {error}")
 
-        await ctx.followup.send(
-            f"Could not find or load that song: {error}",
-            ephemeral=True
+        await ctx.channel.send(
+            f"Could not download that song: {error}"
         )
         return
 
     state = get_music_state(ctx.guild.id)
 
-    await state.queue.put(
-        (audio_url, title, headers)
-    )
+    await state.queue.put((filepath, title))
 
     if state.player_task is None or state.player_task.done():
 
@@ -305,13 +308,13 @@ async def play(
             state.audio_player_task(voice_client)
         )
 
-    await ctx.followup.send(
+    await ctx.channel.send(
         f"Added **{title}** to the queue."
     )
 
 
 # --------------------------------------------------
-# QUEUE COMMAND
+# QUEUE
 # --------------------------------------------------
 
 @bot.slash_command(
@@ -325,37 +328,29 @@ async def queue(ctx):
     upcoming = list(state.queue._queue)
 
     if not state.now_playing and not upcoming:
-
         await ctx.respond("The queue is empty.")
         return
 
     message = ""
 
     if state.now_playing:
-
-        message += (
-            f"**Now playing:** {state.now_playing}\n\n"
-        )
+        message += f"**Now playing:** {state.now_playing}\n\n"
 
     if upcoming:
-
         message += "**Up next:**\n"
 
         for index, song in enumerate(upcoming, start=1):
-
-            _, title, _ = song
-
+            _, title = song
             message += f"`{index}.` {title}\n"
 
     else:
-
         message += "No more songs in the queue."
 
     await ctx.respond(message[:1900])
 
 
 # --------------------------------------------------
-# SKIP COMMAND
+# SKIP
 # --------------------------------------------------
 
 @bot.slash_command(
@@ -367,7 +362,6 @@ async def skip(ctx):
     voice_client = ctx.voice_client
 
     if not voice_client or not voice_client.is_playing():
-
         await ctx.respond(
             "Nothing is currently playing.",
             ephemeral=True
@@ -380,7 +374,7 @@ async def skip(ctx):
 
 
 # --------------------------------------------------
-# PAUSE COMMAND
+# PAUSE
 # --------------------------------------------------
 
 @bot.slash_command(
@@ -392,13 +386,9 @@ async def pause(ctx):
     voice_client = ctx.voice_client
 
     if voice_client and voice_client.is_playing():
-
         voice_client.pause()
-
         await ctx.respond("Music paused.")
-
     else:
-
         await ctx.respond(
             "Nothing is currently playing.",
             ephemeral=True
@@ -406,7 +396,7 @@ async def pause(ctx):
 
 
 # --------------------------------------------------
-# RESUME COMMAND
+# RESUME
 # --------------------------------------------------
 
 @bot.slash_command(
@@ -418,13 +408,9 @@ async def resume(ctx):
     voice_client = ctx.voice_client
 
     if voice_client and voice_client.is_paused():
-
         voice_client.resume()
-
         await ctx.respond("Music resumed.")
-
     else:
-
         await ctx.respond(
             "Music is not paused.",
             ephemeral=True
@@ -432,7 +418,7 @@ async def resume(ctx):
 
 
 # --------------------------------------------------
-# STOP COMMAND
+# STOP
 # --------------------------------------------------
 
 @bot.slash_command(
@@ -441,25 +427,19 @@ async def resume(ctx):
 )
 async def stop(ctx):
 
+    state = get_music_state(ctx.guild.id)
     voice_client = ctx.voice_client
 
-    state = get_music_state(ctx.guild.id)
-
-    # Empty the queue
+    # Empty upcoming queue and remove downloaded files.
     while not state.queue.empty():
 
         try:
-            state.queue.get_nowait()
+            filepath, _ = state.queue.get_nowait()
             state.queue.task_done()
+            state.cleanup(filepath)
         except asyncio.QueueEmpty:
             break
 
-    # Stop current playback
-    if voice_client and voice_client.is_playing():
-
-        voice_client.stop()
-
-    # Cancel the player task
     if state.player_task and not state.player_task.done():
 
         state.player_task.cancel()
@@ -473,16 +453,14 @@ async def stop(ctx):
     state.current = None
     state.now_playing = None
 
-    # Disconnect
     if voice_client:
-
         await voice_client.disconnect()
 
     await ctx.respond("Music stopped and queue cleared.")
 
 
 # --------------------------------------------------
-# CLEAR COMMAND
+# CLEAR
 # --------------------------------------------------
 
 @bot.slash_command(
@@ -496,8 +474,9 @@ async def clear(ctx):
     while not state.queue.empty():
 
         try:
-            state.queue.get_nowait()
+            filepath, _ = state.queue.get_nowait()
             state.queue.task_done()
+            state.cleanup(filepath)
         except asyncio.QueueEmpty:
             break
 
@@ -505,7 +484,7 @@ async def clear(ctx):
 
 
 # --------------------------------------------------
-# NOW PLAYING COMMAND
+# NOW PLAYING
 # --------------------------------------------------
 
 @bot.slash_command(
@@ -517,13 +496,10 @@ async def nowplaying(ctx):
     state = get_music_state(ctx.guild.id)
 
     if state.now_playing:
-
         await ctx.respond(
             f"**Now playing:** {state.now_playing}"
         )
-
     else:
-
         await ctx.respond(
             "Nothing is currently playing.",
             ephemeral=True
@@ -531,7 +507,7 @@ async def nowplaying(ctx):
 
 
 # --------------------------------------------------
-# RUN BOT
+# RUN
 # --------------------------------------------------
 
 bot.run(TOKEN)
